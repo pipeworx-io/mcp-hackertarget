@@ -2,7 +2,7 @@
 
 [HackerTarget](https://hackertarget.com/ip-tools/) MCP — keyless DNS/recon utilities. Free tier 100 queries/day per source IP.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1558+ live data sources.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1576+ live data sources.
 
 Responses are line-oriented plain text from upstream; this pack parses them into structured JSON when reasonable.
 
@@ -75,7 +75,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1558+ data sources. The
+Both URLs reach the same gateway and the same 1576+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 

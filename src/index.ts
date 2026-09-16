@@ -1,6 +1,10 @@
 interface McpToolDefinition {
   name: string;
   description: string;
+  /** Human-facing one-liner (fleet #1967). Optional; consumers fall back to
+   *  description. Kept in step with shared/src/types.ts — scripts/lib/
+   *  check-inlined-types.mjs reports drift at publish time. */
+  summary?: string;
   inputSchema: {
     type: 'object';
     properties: Record<string, unknown>;
@@ -19,6 +23,203 @@ interface McpToolExport {
   cost?: Record<string, unknown>;
   provider?: string;
 }
+
+/**
+ * Was this failure OUR OWN web service? — the other half of `internal-db-class.ts`.
+ *
+ * fleet #1089 pulled failures from our own Postgres out of `upstream_down` by
+ * keying on the SQLSTATE inside PostgREST's four-key error envelope. That
+ * covered the majority and structurally could not cover the rest: the rest
+ * never reach Postgres, so they carry no SQLSTATE. What was left, measured over
+ * the 24h to 2026-09-02T15:00Z (fleet #1096):
+ *
+ *     5  pipeworx-catalog  get_pack_tools     Pipeworx catalog error: 522 — error code: 522
+ *     3  fleet             fleet_list_open …  upstream_down: Fleet task queue did not respond within 25s
+ *
+ * 521/522/523/526 are Cloudflare saying its edge could not reach an ORIGIN, and
+ * in both of those rows the origin is ours — `gateway.pipeworx.io` for the
+ * catalog pack (it self-fetches when the gateway hasn't injected a manifest),
+ * our own Supabase for fleet. There is no third party anywhere in either call.
+ * Same defect as #1089: our own outage filed under `upstream_down`, the one
+ * class that means "the source is unreachable and there is nothing for us to
+ * fix", which is why the problem-tools triage skips it.
+ *
+ * WHY NOT A WORDING RULE. The obvious fix is to match `fleet db error:` and
+ * `Pipeworx catalog error:` in classifyToolError. Each is emitted from exactly
+ * one site today, so it would work today. It would also rot the first time
+ * somebody rewords a label — silently, and in the direction of hiding our own
+ * outage, which is worse than the bug being fixed. Every prose rule in
+ * error-class.ts has needed widening as packs invented new wording (#409/#450/
+ * #584); that history is most of that file's comment budget.
+ *
+ * WHAT THIS KEYS ON INSTEAD: **the host the call actually reached.** A URL's
+ * hostname is a fact about the call, not a guess about its prose. Two
+ * consequences that a pack-level flag could not give us, and the reason the
+ * flag was rejected:
+ *
+ *   - It describes the CALL, not the pack. `govcon-intel` fans out to our own
+ *     Supabase AND to genuine third parties; `court-listener` holds our cache
+ *     in Supabase and fetches courtlistener.com. An `internallyHosted: true` on
+ *     either pack would relabel a real third-party outage as ours — inventing
+ *     work, which is the same class of error in the opposite direction.
+ *   - It covers every future internal pack for free, instead of one declared
+ *     slug at a time.
+ *
+ * WHY IT SURVIVES A REWORD. The marker below is not matched as a literal by two
+ * separate files. `markInternalOrigin()` writes it and `internalHostMetricsClass()`
+ * reads it, both from the single exported `INTERNAL_ORIGIN_MARKER` constant in
+ * this module — so changing the wording changes both sides in the same edit and
+ * cannot desynchronise them. The pack's own label (`fleet db error:`,
+ * `Pipeworx catalog error:`) is not read at all: reword it freely, the class is
+ * unaffected. That is the property `stripClassPrefix` lacked when it drifted
+ * from its own classifier three times and needed a CI gate to hold them
+ * together.
+ *
+ * WHERE THE 5xx TEST LIVES. `markInternalOrigin` is called from the places that
+ * hold the real `Response` — `httpError`/`httpErrorMessage` and the timeout
+ * branch of `fetchWithTimeout` in `shared/src/http.ts` — so "is this an
+ * availability failure" is decided from the actual status code, never re-derived
+ * by scraping a number out of a sentence. A 404 from our own registry for a slug
+ * that does not exist is a caller's bad argument and is deliberately NOT marked.
+ */
+
+/**
+ * OUR OWN web service was unreachable — not an upstream, and never `upstream_down`.
+ *
+ * ONE value, not three, unlike `internal_db_*`. That split existed because a
+ * slow query, an exhausted pool and an unknown SQLSTATE have different owners
+ * and different fixes. Here there is only one story to tell — an origin we run
+ * did not answer the edge — and one owner. A bucket with no distinct owner per
+ * value is decoration; #724 is what happens when a class holds several
+ * situations, and inventing sub-values ahead of a reason to act on them
+ * differently is the same mistake with the sign flipped.
+ *
+ * METRICS ONLY, exactly like PLATFORM_KEY_ERROR_CLASS and the internal_db
+ * values. `classifyToolError` still answers `upstream_down` for the retry and
+ * hint paths, which only care whether retrying or a sibling tool might work —
+ * and it might. Nothing a caller sees or is charged changes here.
+ *
+ * READ SIDE: this value is in BROKEN_TOOL_CLASSES, FAULT_CLASSES and
+ * ALL_ERROR_CLASSES in `workers/registry-api/src/index.ts`. All three, or it
+ * lands on no dashboard — fleet #721 is the warning, where the #719 split
+ * worked on the write side and was invisible for weeks.
+ */
+const INTERNAL_SERVICE_UNREACHABLE_CLASS = 'internal_service_unreachable';
+
+/**
+ * The token that carries "this origin is ours" from the call site to the
+ * classifier.
+ *
+ * Appended to the error message rather than attached to the Error object,
+ * because the object does not survive the trip: 275 packs return `{ error:
+ * string }` instead of throwing, the gateway reads `observedError` as a string,
+ * and the fleet pack rebuilds its error from a captured status + body across a
+ * retry loop. A property on an Error would be dropped by every one of those
+ * paths and the class would work in tests and vanish in production.
+ *
+ * WORDING IS LOAD-BEARING, same rule as labelAge's note in authority.ts. This
+ * string is appended to a pack's thrown Error message (shared/src/http.ts),
+ * and a thrown Error's message is exactly what the gateway hands back to the
+ * caller as `content[0].text` when nothing rewrites it (workers/gateway/src
+ * catches the throw and sets `rawResult.message = stripClassPrefix(error)`,
+ * which does not touch this suffix) — so the original wording,
+ * " [pipeworx-hosted origin — our own service, not a third party]", was not a
+ * theoretical leak: it shipped live on pipeworx-catalog's 522s, 7 times in 6
+ * hours on 2026-09-02 (see tests/golden-internal-service.test.ts), verbatim
+ * naming Pipeworx as the host. check:hosting-claims never caught it because it
+ * did not scan shared/ at all (task #2009). Reworded to describe the
+ * OBSERVATION (the origin did not answer) without a claim about who runs it —
+ * the identical fix labelAge got: drop the possessive, keep the fact.
+ */
+const INTERNAL_ORIGIN_MARKER = ' [origin did not respond — retry before concluding the named source is down]';
+
+/**
+ * Supabase's data plane for a project is `<ref>.supabase.co`, where the ref is
+ * exactly twenty lowercase letters (ours is `pqauisounztsgdgfkhke`).
+ *
+ * Matching the shape rather than listing the ref keeps this correct when we add
+ * a project — `supabaseEnv` on a pack entry already points some packs at a
+ * second one — while still excluding `status.supabase.co`, which is Supabase's
+ * own status page and emphatically not our database. Verified 2026-09-02 by
+ * `grep -rhoE '[a-z0-9-]+\.supabase\.(co|in)' mcps shared workers scripts`: the
+ * only real project ref anywhere in the tree is ours, the rest are doc
+ * placeholders (`abc`, `xyz`, `example`) which this pattern also excludes. Same
+ * finding internal-db-class.ts relies on for the PostgREST envelope being ours
+ * by construction.
+ */
+const SUPABASE_PROJECT_HOST = /^[a-z]{20}\.supabase\.(co|in)$/;
+
+/**
+ * Is this a host WE run?
+ *
+ * Deliberately NOT including `*.workers.dev`: plenty of third-party APIs are
+ * hosted on workers.dev, so the suffix says where something runs and not who
+ * owns it. Every internal call we actually make goes to a `pipeworx.io`
+ * hostname or to our Supabase project, both of which are ownership facts.
+ *
+ * `workers/gateway/src/provenance.ts`'s `OUR_HOSTS` answers the same
+ * question and DOES include `workers.dev` — a documented divergence
+ * (task #2051), not a bug to converge. That list decides what a response may
+ * cite as a data SOURCE, where a false negative (citing our own worker as an
+ * external source) is the hosting-disclosure leak this whole file exists to
+ * prevent, so it errs broad. This one decides who gets BLAMED for a 5xx in
+ * outage metrics read by on-call, where a false positive (crediting our own
+ * infra with a third party's outage) hides the real failure, so it errs
+ * narrow. Same suffix, opposite direction, because they are never called for
+ * the same reason.
+ *
+ * Returns false on anything unparseable rather than throwing — this runs inside
+ * an error path, and an error path that can itself throw turns a diagnosable
+ * failure into a mystery.
+ */
+function isPipeworxOrigin(url: string | URL | undefined | null): boolean {
+  if (!url) return false;
+  let host: string;
+  try {
+    host = new URL(url instanceof URL ? url.href : url).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (host === 'pipeworx.io' || host.endsWith('.pipeworx.io')) return true;
+  return SUPABASE_PROJECT_HOST.test(host);
+}
+
+/**
+ * Append the marker when this failure was OUR origin failing to answer.
+ *
+ * `status` is the HTTP status when there is one, and omitted for a timeout —
+ * where there is no response at all, and "the origin did not answer" is the
+ * whole observation. Statuses below 500 are left alone: a 404 from our own
+ * registry for a slug that does not exist is the caller's argument, not our
+ * outage, and marking it would put ordinary 404s on the incident dashboard.
+ *
+ * Idempotent, so a message that is wrapped and re-marked on the way up (the
+ * fleet pack's retry loop re-throws through two layers) carries the marker once.
+ */
+function markInternalOrigin(
+  message: string,
+  url: string | URL | undefined | null,
+  status?: number,
+): string {
+  if (status !== undefined && status < 500) return message;
+  if (!isPipeworxOrigin(url)) return message;
+  if (message.includes(INTERNAL_ORIGIN_MARKER)) return message;
+  return message + INTERNAL_ORIGIN_MARKER;
+}
+
+/**
+ * Which blob4 value a failure from our own web services books as, or undefined
+ * if this is not one.
+ *
+ * Ordered AFTER `internalDbMetricsClass` at the call site: a PostgREST envelope
+ * from our own Supabase is a strictly more specific statement about the same
+ * row (which of our services, and why), and the two cannot disagree about
+ * whether the failure is ours.
+ */
+function internalHostMetricsClass(error: string): string | undefined {
+  return error.includes(INTERNAL_ORIGIN_MARKER) ? INTERNAL_SERVICE_UNREACHABLE_CLASS : undefined;
+}
+
 
 /**
  * One place to turn a failed `fetch` into an error a caller can act on.
@@ -434,187 +635,17 @@ function pickMessage(node: unknown, depth: number): string | null {
 function collapse(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }
-
-/**
- * Was this failure OUR OWN web service? — the other half of `internal-db-class.ts`.
- *
- * fleet #1089 pulled failures from our own Postgres out of `upstream_down` by
- * keying on the SQLSTATE inside PostgREST's four-key error envelope. That
- * covered the majority and structurally could not cover the rest: the rest
- * never reach Postgres, so they carry no SQLSTATE. What was left, measured over
- * the 24h to 2026-09-02T15:00Z (fleet #1096):
- *
- *     5  pipeworx-catalog  get_pack_tools     Pipeworx catalog error: 522 — error code: 522
- *     3  fleet             fleet_list_open …  upstream_down: Fleet task queue did not respond within 25s
- *
- * 521/522/523/526 are Cloudflare saying its edge could not reach an ORIGIN, and
- * in both of those rows the origin is ours — `gateway.pipeworx.io` for the
- * catalog pack (it self-fetches when the gateway hasn't injected a manifest),
- * our own Supabase for fleet. There is no third party anywhere in either call.
- * Same defect as #1089: our own outage filed under `upstream_down`, the one
- * class that means "the source is unreachable and there is nothing for us to
- * fix", which is why the problem-tools triage skips it.
- *
- * WHY NOT A WORDING RULE. The obvious fix is to match `fleet db error:` and
- * `Pipeworx catalog error:` in classifyToolError. Each is emitted from exactly
- * one site today, so it would work today. It would also rot the first time
- * somebody rewords a label — silently, and in the direction of hiding our own
- * outage, which is worse than the bug being fixed. Every prose rule in
- * error-class.ts has needed widening as packs invented new wording (#409/#450/
- * #584); that history is most of that file's comment budget.
- *
- * WHAT THIS KEYS ON INSTEAD: **the host the call actually reached.** A URL's
- * hostname is a fact about the call, not a guess about its prose. Two
- * consequences that a pack-level flag could not give us, and the reason the
- * flag was rejected:
- *
- *   - It describes the CALL, not the pack. `govcon-intel` fans out to our own
- *     Supabase AND to genuine third parties; `court-listener` holds our cache
- *     in Supabase and fetches courtlistener.com. An `internallyHosted: true` on
- *     either pack would relabel a real third-party outage as ours — inventing
- *     work, which is the same class of error in the opposite direction.
- *   - It covers every future internal pack for free, instead of one declared
- *     slug at a time.
- *
- * WHY IT SURVIVES A REWORD. The marker below is not matched as a literal by two
- * separate files. `markInternalOrigin()` writes it and `internalHostMetricsClass()`
- * reads it, both from the single exported `INTERNAL_ORIGIN_MARKER` constant in
- * this module — so changing the wording changes both sides in the same edit and
- * cannot desynchronise them. The pack's own label (`fleet db error:`,
- * `Pipeworx catalog error:`) is not read at all: reword it freely, the class is
- * unaffected. That is the property `stripClassPrefix` lacked when it drifted
- * from its own classifier three times and needed a CI gate to hold them
- * together.
- *
- * WHERE THE 5xx TEST LIVES. `markInternalOrigin` is called from the places that
- * hold the real `Response` — `httpError`/`httpErrorMessage` and the timeout
- * branch of `fetchWithTimeout` in `shared/src/http.ts` — so "is this an
- * availability failure" is decided from the actual status code, never re-derived
- * by scraping a number out of a sentence. A 404 from our own registry for a slug
- * that does not exist is a caller's bad argument and is deliberately NOT marked.
- */
-
-/**
- * OUR OWN web service was unreachable — not an upstream, and never `upstream_down`.
- *
- * ONE value, not three, unlike `internal_db_*`. That split existed because a
- * slow query, an exhausted pool and an unknown SQLSTATE have different owners
- * and different fixes. Here there is only one story to tell — an origin we run
- * did not answer the edge — and one owner. A bucket with no distinct owner per
- * value is decoration; #724 is what happens when a class holds several
- * situations, and inventing sub-values ahead of a reason to act on them
- * differently is the same mistake with the sign flipped.
- *
- * METRICS ONLY, exactly like PLATFORM_KEY_ERROR_CLASS and the internal_db
- * values. `classifyToolError` still answers `upstream_down` for the retry and
- * hint paths, which only care whether retrying or a sibling tool might work —
- * and it might. Nothing a caller sees or is charged changes here.
- *
- * READ SIDE: this value is in BROKEN_TOOL_CLASSES, FAULT_CLASSES and
- * ALL_ERROR_CLASSES in `workers/registry-api/src/index.ts`. All three, or it
- * lands on no dashboard — fleet #721 is the warning, where the #719 split
- * worked on the write side and was invisible for weeks.
- */
-const INTERNAL_SERVICE_UNREACHABLE_CLASS = 'internal_service_unreachable';
-
-/**
- * The token that carries "this origin is ours" from the call site to the
- * classifier.
- *
- * Appended to the error message rather than attached to the Error object,
- * because the object does not survive the trip: 275 packs return `{ error:
- * string }` instead of throwing, the gateway reads `observedError` as a string,
- * and the fleet pack rebuilds its error from a captured status + body across a
- * retry loop. A property on an Error would be dropped by every one of those
- * paths and the class would work in tests and vanish in production.
- *
- * Written as a sentence rather than a sigil because it is going to be read by
- * whoever gets the error, and "our own service, not a third party" is the
- * single most useful thing to tell them — fetchWithTimeout's own comment
- * (fleet #1047) is about exactly this ambiguity, where blaming a healthy vendor
- * by name sent the next person waiting for an outage that did not exist.
- */
-const INTERNAL_ORIGIN_MARKER = ' [pipeworx-hosted origin — our own service, not a third party]';
-
-/**
- * Supabase's data plane for a project is `<ref>.supabase.co`, where the ref is
- * exactly twenty lowercase letters (ours is `pqauisounztsgdgfkhke`).
- *
- * Matching the shape rather than listing the ref keeps this correct when we add
- * a project — `supabaseEnv` on a pack entry already points some packs at a
- * second one — while still excluding `status.supabase.co`, which is Supabase's
- * own status page and emphatically not our database. Verified 2026-09-02 by
- * `grep -rhoE '[a-z0-9-]+\.supabase\.(co|in)' mcps shared workers scripts`: the
- * only real project ref anywhere in the tree is ours, the rest are doc
- * placeholders (`abc`, `xyz`, `example`) which this pattern also excludes. Same
- * finding internal-db-class.ts relies on for the PostgREST envelope being ours
- * by construction.
- */
-const SUPABASE_PROJECT_HOST = /^[a-z]{20}\.supabase\.(co|in)$/;
-
-/**
- * Is this a host WE run?
- *
- * Deliberately NOT including `*.workers.dev`: plenty of third-party APIs are
- * hosted on workers.dev, so the suffix says where something runs and not who
- * owns it. Every internal call we actually make goes to a `pipeworx.io`
- * hostname or to our Supabase project, both of which are ownership facts.
- *
- * Returns false on anything unparseable rather than throwing — this runs inside
- * an error path, and an error path that can itself throw turns a diagnosable
- * failure into a mystery.
- */
-function isPipeworxOrigin(url: string | URL | undefined | null): boolean {
-  if (!url) return false;
-  let host: string;
-  try {
-    host = new URL(url instanceof URL ? url.href : url).hostname.toLowerCase();
-  } catch {
-    return false;
-  }
-  if (host === 'pipeworx.io' || host.endsWith('.pipeworx.io')) return true;
-  return SUPABASE_PROJECT_HOST.test(host);
-}
-
-/**
- * Append the marker when this failure was OUR origin failing to answer.
- *
- * `status` is the HTTP status when there is one, and omitted for a timeout —
- * where there is no response at all, and "the origin did not answer" is the
- * whole observation. Statuses below 500 are left alone: a 404 from our own
- * registry for a slug that does not exist is the caller's argument, not our
- * outage, and marking it would put ordinary 404s on the incident dashboard.
- *
- * Idempotent, so a message that is wrapped and re-marked on the way up (the
- * fleet pack's retry loop re-throws through two layers) carries the marker once.
- */
-function markInternalOrigin(
-  message: string,
-  url: string | URL | undefined | null,
-  status?: number,
-): string {
-  if (status !== undefined && status < 500) return message;
-  if (!isPipeworxOrigin(url)) return message;
-  if (message.includes(INTERNAL_ORIGIN_MARKER)) return message;
-  return message + INTERNAL_ORIGIN_MARKER;
-}
-
-/**
- * Which blob4 value a failure from our own web services books as, or undefined
- * if this is not one.
- *
- * Ordered AFTER `internalDbMetricsClass` at the call site: a PostgREST envelope
- * from our own Supabase is a strictly more specific statement about the same
- * row (which of our services, and why), and the two cannot disagree about
- * whether the failure is ours.
- */
-function internalHostMetricsClass(error: string): string | undefined {
-  return error.includes(INTERNAL_ORIGIN_MARKER) ? INTERNAL_SERVICE_UNREACHABLE_CLASS : undefined;
-}
-
-
 /**
  * HackerTarget MCP.
+ *
+ * Keyless DNS / network-recon utilities from HackerTarget's public IP Tools API
+ * (https://api.hackertarget.com). Every endpoint answers line-oriented plain
+ * text for a single `target` (a domain, an IP, a CIDR, or a URL), which this
+ * pack splits into a `lines` array and also returns verbatim as `raw`.
+ *
+ * Free tier is 100 queries/day PER SOURCE IP — that is the gateway's egress IP,
+ * shared across all callers, so an exhausted quota surfaces as an
+ * "API count exceeded" error rather than a rate-limit status code.
  */
 
 
@@ -629,6 +660,8 @@ async function pwFetch(url: string | URL, init?: RequestInit): Promise<Response>
 const BASE = 'https://api.hackertarget.com';
 const UA = 'pipeworx-mcp-hackertarget/1.0 (+https://pipeworx.io)';
 
+// Tool name -> HackerTarget API path. The HANDLER reads this; the tool defs
+// below are written out literally (see the note on `tools`).
 const ENDPOINTS = {
   dns_lookup: 'dnslookup',
   reverse_dns: 'reversedns',
@@ -646,17 +679,117 @@ const ENDPOINTS = {
   page_links: 'pagelinks',
 };
 
-const shape = {
-  type: 'object' as const,
-  properties: { target: { type: 'string' as const } },
-  required: ['target'],
-};
+function targetSchema(description: string) {
+  return {
+    type: 'object' as const,
+    properties: { target: { type: 'string' as const, description } },
+    required: ['target'],
+  };
+}
 
-const tools: McpToolExport['tools'] = Object.keys(ENDPOINTS).map((k) => ({
-  name: k,
-  description: `HackerTarget ${k} lookup.`,
-  inputSchema: shape,
-}));
+// The tool definitions are a LITERAL ARRAY on purpose.
+//
+// These 14 tools share one argument and one response shape, so the obvious
+// spelling is `Object.keys(ENDPOINTS).map(...)`. That is what it used to be, and
+// it broke publishing: scripts/render-pack-readme.mjs reads pack source
+// STATICALLY, finds no `{ name: ... }` literal, and refuses to render a README
+// with an empty Tools table. There IS a runtime fallback (evaluatePackTools),
+// but it needs `typescript` resolvable from the repo root, so it returns null in
+// a fresh worktree — which is exactly what the worktree-per-session rule
+// mandates and what a publish sweep runs in. The fallback evaporates precisely
+// where publishing happens. On 2026-09-16 that skipped this pack out of a
+// 302-pack npm first-publish sweep (fleet #2125).
+//
+// Writing them out also bought real descriptions. The generated ones read
+// "HackerTarget dns_lookup lookup." for all fourteen — which names the verb and
+// not the source, so the router could not tell any of them apart.
+// `pnpm check:literal-tools` now fails if this reverts.
+const tools: McpToolExport['tools'] = [
+  {
+    name: 'dns_lookup',
+    description:
+      '"Resolve [domain]" / "what IP does [site] point at" / "A records for [X]" — forward DNS lookup via HackerTarget, returning the A/AAAA/MX/NS/SOA records the resolver holds for a hostname. Use to check where a domain currently points, or to confirm a DNS change has propagated.',
+    inputSchema: targetSchema('Hostname to resolve, e.g. "pipeworx.io". Not a URL — strip the scheme and path.'),
+  },
+  {
+    name: 'reverse_dns',
+    description:
+      '"What hostname is [IP]" / "reverse DNS for [address]" / "PTR record lookup" — reverse DNS (PTR) lookup via HackerTarget, mapping an IP address back to the hostname its owner published. Use to identify the operator behind an address in a log line. Returns nothing when no PTR record is set, which is common for cloud IPs.',
+    inputSchema: targetSchema('IPv4 or IPv6 address, e.g. "8.8.8.8".'),
+  },
+  {
+    name: 'mtr',
+    description:
+      '"Network path to [host]" / "where does traffic to [X] slow down" / "per-hop latency" — mtr report via HackerTarget, combining traceroute and ping into a per-hop table of loss and latency measured FROM HackerTarget\'s probe host, not from you. Use to see which network hop is losing packets. REQUIRES AN API KEY: HackerTarget gates this endpoint, and the keyless tier answers "error valid key required" (verified 2026-09-16).',
+    inputSchema: targetSchema('Hostname or IP to trace to, e.g. "1.1.1.1".'),
+  },
+  {
+    name: 'nping',
+    description:
+      '"Is [host] up" / "ping [X]" / "round-trip time to [address]" — ICMP ping via HackerTarget, reporting reachability and round-trip time from HackerTarget\'s probe host. Use for a liveness check when you cannot ping from where you are. A host that blocks ICMP reads as down even when it serves traffic.',
+    inputSchema: targetSchema('Hostname or IP to ping, e.g. "pipeworx.io".'),
+  },
+  {
+    name: 'dns_host_search',
+    description:
+      '"Subdomains of [domain]" / "what hosts exist under [X]" / "find an admin or staging subdomain" — passive DNS host search via HackerTarget, listing known subdomains of a domain with their IPs, drawn from previously observed DNS data rather than by guessing names. Use for attack-surface inventory or to find a forgotten staging host.',
+    inputSchema: targetSchema('Registrable domain to enumerate, e.g. "pipeworx.io" (not a subdomain).'),
+  },
+  {
+    name: 'find_shared_dns',
+    description:
+      '"What else uses this nameserver" / "domains sharing DNS with [X]" — shared-nameserver search via HackerTarget, listing other domains served by the same DNS server. Use to map the infrastructure footprint of an operator, or to see who else would be affected if a nameserver went down.',
+    inputSchema: targetSchema('Nameserver hostname or a domain whose nameservers to pivot on, e.g. "ns1.example.com".'),
+  },
+  {
+    name: 'geoip',
+    description:
+      '"Where is [IP] located" / "what country is this address in" / "geolocate an IP" — IP geolocation via HackerTarget, returning country, state/region, city and coordinates for an address. City-level accuracy is approximate and a VPN or CDN address reports its datacenter, not its user. Use for coarse traffic attribution, never to locate a person.',
+    inputSchema: targetSchema('IPv4 or IPv6 address, e.g. "104.18.0.1".'),
+  },
+  {
+    name: 'reverse_ip',
+    description:
+      '"What else is hosted on [IP]" / "other sites on the same server" / "reverse IP lookup" — reverse IP lookup via HackerTarget, listing hostnames known to resolve to one address. Use to spot shared hosting or to find sibling properties of an operator. A CDN address returns many unrelated sites, so co-location is not evidence of common ownership.',
+    inputSchema: targetSchema('IPv4 address, e.g. "104.18.0.1".'),
+  },
+  {
+    name: 'as_lookup',
+    description:
+      '"Which ASN owns [IP]" / "what network is this address on" / "who is the upstream provider" — autonomous system lookup via HackerTarget, returning the ASN, the announced prefix and the network\'s name for an address. Use to attribute an address to a hosting provider, ISP or cloud region.',
+    inputSchema: targetSchema('IPv4 address or ASN, e.g. "1.1.1.1" or "AS13335".'),
+  },
+  {
+    name: 'whois',
+    description:
+      '"Who owns [domain]" / "when does [X] expire" / "whois lookup" / "registrar for [site]" — WHOIS record via HackerTarget for a domain or IP: registrar, creation and expiry dates, nameservers, and whatever contact fields the registry still publishes. REQUIRES AN API KEY: HackerTarget gates this endpoint, and the keyless tier answers "error valid key required" (verified 2026-09-16). For keyless WHOIS use ripe_stat_whois.',
+    inputSchema: targetSchema('Domain name or IP address, e.g. "pipeworx.io".'),
+  },
+  {
+    name: 'http_headers',
+    description:
+      '"What headers does [site] return" / "what server runs [X]" / "check the security headers" / "does [site] redirect" — HTTP response headers fetched by HackerTarget, including status line, Server, redirect Location, and security headers such as HSTS and CSP. Use to fingerprint a stack or audit header hygiene without loading the page yourself.',
+    inputSchema: targetSchema('Hostname or full URL, e.g. "pipeworx.io" or "https://pipeworx.io/".'),
+  },
+  {
+    name: 'traceroute',
+    description:
+      '"Traceroute to [host]" / "what route does traffic take to [X]" / "how many hops to [address]" — traceroute via HackerTarget, listing the routers between HackerTarget\'s probe host and the target. The path is measured from their network, not yours. REQUIRES AN API KEY: HackerTarget gates this endpoint, and the keyless tier answers "error valid key required" (verified 2026-09-16).',
+    inputSchema: targetSchema('Hostname or IP to trace to, e.g. "pipeworx.io".'),
+  },
+  {
+    name: 'subnet_lookup',
+    description:
+      '"What is the range of [CIDR]" / "how many hosts in a /24" / "network and broadcast address for [X]" / "subnet calculator" — subnet arithmetic via HackerTarget, returning network address, broadcast address, usable host range, netmask and host count for a CIDR block. A pure calculation over the input; it does not probe the network.',
+    inputSchema: targetSchema('CIDR block or address with prefix, e.g. "192.168.1.0/24".'),
+  },
+  {
+    name: 'page_links',
+    description:
+      '"What does [page] link to" / "extract every link from [URL]" / "outbound links on a page" — link extraction via HackerTarget, fetching one web page and returning the URLs it links to. Use to map a site section or find outbound references. One page only — it does not crawl, and it returns the links as published, not their fetched status.',
+    inputSchema: targetSchema('Full URL of the page to read, e.g. "https://pipeworx.io/". Include the scheme.'),
+  },
+];
 
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
   const path = (ENDPOINTS as Record<string, string>)[name];

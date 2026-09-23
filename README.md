@@ -1,35 +1,69 @@
 # @pipeworx/hackertarget
 
-[HackerTarget](https://hackertarget.com/ip-tools/) MCP — keyless DNS/recon utilities. Free tier 100 queries/day per source IP.
+[HackerTarget](https://hackertarget.com/ip-tools/) MCP — DNS and network-recon
+utilities. Eleven of the fourteen tools need no credential; three
+(`whois`, `mtr`, `traceroute`) require the caller's own HackerTarget key.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1576+ live data sources.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1663+ live data sources.
 
-Responses are line-oriented plain text from upstream; this pack parses them into structured JSON when reasonable.
+Responses are line-oriented plain text from upstream; this pack parses them into
+structured JSON when reasonable (`lines[]` plus the verbatim `raw`).
 
 ## Tools
 
-- `dns_lookup(target)` — A records (line-per-result)
-- `reverse_dns(target)` — reverse DNS for an IP
-- `mtr(target)` — mtr (network path)
-- `nping(target)` — ping
-- `dns_host_search(target)` — passive DNS host search
-- `find_shared_dns(target)` — domains sharing the same DNS server
-- `geoip(target)` — IP geolocation
-- `reverse_ip(target)` — hosts on the same IP
-- `as_lookup(target)` — AS lookup
-- `whois(target)` — whois
-- `http_headers(target)` — fetch HTTP headers
-- `traceroute(target)` — traceroute
-- `subnet_lookup(target)` — subnet info
-- `page_links(target)` — links extracted from a page (URL)
+Keyless — call with just `target`:
 
-## Notes
+- `dns_lookup(target)` — A/AAAA/MX/NS/SOA records for a hostname
+- `reverse_dns(target)` — reverse DNS (PTR) for an IP
+- `nping(target)` — ICMP ping from HackerTarget's probe host
+- `dns_host_search(target)` — passive DNS subdomain search
+- `find_shared_dns(target)` — domains sharing the same nameserver
+- `geoip(target)` — IP geolocation (country / region / city / coords)
+- `reverse_ip(target)` — hostnames resolving to the same IP
+- `as_lookup(target)` — ASN, announced prefix and network name
+- `http_headers(target)` — HTTP response headers for a host or URL
+- `subnet_lookup(target)` — subnet arithmetic for a CIDR block
+- `page_links(target)` — links extracted from one page (full URL)
 
-- Pipeworx-side rate limit is the outer envelope; HackerTarget's own daily 100/IP cap applies per gateway egress IP.
+Require a caller-supplied key — call with `target` **and** `_apiKey`:
 
-## Data source
+- `whois(target, _apiKey)` — WHOIS record for a domain or IP
+- `mtr(target, _apiKey)` — per-hop loss/latency report
+- `traceroute(target, _apiKey)` — routers between HackerTarget and the target
 
-`https://api.hackertarget.com`
+## Auth
+
+Pipeworx fronts **no** platform key for HackerTarget. The eleven keyless tools
+work with no credential at all; `whois`, `mtr` and `traceroute` are gated behind
+a HackerTarget membership and are bring-your-own-key (Bruce's ruling, fleet
+#2132, 2026-09-16).
+
+Get a key from the HackerTarget member dashboard
+(<https://hackertarget.com/ip-tools/>) and pass it as `_apiKey`. It is forwarded
+as the `apikey=` query parameter HackerTarget documents.
+
+A keyless call to one of the three gated tools is refused **before** any request
+leaves the gateway, with `error: auth_required` and a message saying the tool
+*requires an API key* and where to get one. It is not an outage and does not
+count as a tool failure. A key that is supplied and then rejected by HackerTarget
+gets a different `auth_required` message — "the key you supplied was refused" —
+so a caller who already holds a key is not sent to fetch it again.
+
+Passing `_apiKey` to the eleven keyless tools is allowed and useful: it bills the
+call against the caller's own member quota instead of the shared free tier.
+
+## Rate limits
+
+HackerTarget's free tier is **50 calls/day per source IP** at up to 2 requests/s
+(their FAQ, re-read 2026-09-16 — older copies of this file said 100). That source
+IP is the gateway's shared egress, so an exhausted quota surfaces as an
+`API count exceeded` body rather than an HTTP 429. Pipeworx's own rate limit is
+the outer envelope. Callers who bring `_apiKey` draw on their own quota.
+
+## Data sources
+
+- `https://api.hackertarget.com` — every tool in this pack
+- <https://hackertarget.com/ip-tools/> — endpoint, auth and quota documentation
 
 ## Quick Start
 
@@ -75,7 +109,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1576+ data sources. The
+Both URLs reach the same gateway and the same 1663+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 

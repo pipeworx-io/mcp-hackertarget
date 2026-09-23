@@ -638,14 +638,21 @@ function collapse(s: string): string {
 /**
  * HackerTarget MCP.
  *
- * Keyless DNS / network-recon utilities from HackerTarget's public IP Tools API
+ * DNS / network-recon utilities from HackerTarget's IP Tools API
  * (https://api.hackertarget.com). Every endpoint answers line-oriented plain
  * text for a single `target` (a domain, an IP, a CIDR, or a URL), which this
  * pack splits into a `lines` array and also returns verbatim as `raw`.
  *
- * Free tier is 100 queries/day PER SOURCE IP — that is the gateway's egress IP,
- * shared across all callers, so an exhausted quota surfaces as an
- * "API count exceeded" error rather than a rate-limit status code.
+ * ELEVEN of the fourteen tools are keyless. THREE — whois, mtr and traceroute —
+ * are gated behind a HackerTarget membership and are BYOK (see KEY_GATED below,
+ * and fleet #2132/#2138).
+ *
+ * The free tier is 50 calls/day PER SOURCE IP at up to 2 req/s (hackertarget.com
+ * FAQ, re-read 2026-09-16 — it used to be 100 and this comment still said so).
+ * That IP is the gateway's egress, shared across all callers, so an exhausted
+ * quota surfaces as an "API count exceeded" body rather than a 429. A caller
+ * who passes their own member key as `_apiKey` is billed against their own
+ * quota instead, on every tool, not just the three gated ones.
  */
 
 
@@ -679,11 +686,61 @@ const ENDPOINTS = {
   page_links: 'pagelinks',
 };
 
+// The three endpoints HackerTarget gates behind a paid membership. A keyless
+// call to any of them answers the plain-text line "error valid key required" —
+// a refusal, not a result. Bruce ruled BYOK for these on 2026-09-16 (fleet
+// #2132): callers bring their own key, Pipeworx fronts none.
+//
+// The gate is enforced HERE, before any fetch, for two reasons. It costs a
+// caller an upstream round-trip to learn something this pack already knows;
+// and forwarding HackerTarget's own string classified the refusal as `error`
+// (workers/gateway/src/error-class.ts), which books an expected access wall as
+// a Pipeworx tool failure in the quality lane's accounting. `auth_required:`
+// is the classifier's token for "this is a gate" and is stripped before the
+// message reaches the caller (fleet #2138, feedback_gated_refusal_wording).
+const KEY_GATED = new Set(['whois', 'mtr', 'traceroute']);
+
+// Read by the gateway as `where_to_get_key` and appended to the pre-flight
+// refusal, so the wall names the door (fleet #1226). Three constraints on this
+// string, all load-bearing:
+//   - it must carry an http(s) URL, or inputShapeFromSchema drops it entirely;
+//   - it must contain the literal phrase "requires an API key", which is the
+//     wording the quality lane's gated-refusal rule keys on;
+//   - it must NOT contain the words "optional", "keyless" or "omit", which
+//     callerKeyIsMandatory() reads as "this key is an upgrade, not a gate" —
+//     that would un-sink these three tools in the router shortlist and put a
+//     keyless caller back on a tool that cannot answer them.
+const KEY_HINT =
+  'Your HackerTarget API key, from the member dashboard. HackerTarget requires an API key for whois, mtr and traceroute — its free tier refuses those three with "error valid key required". Pipeworx supplies no key for this pack. Membership and API docs: https://hackertarget.com/ip-tools/';
+
 function targetSchema(description: string) {
   return {
     type: 'object' as const,
     properties: { target: { type: 'string' as const, description } },
     required: ['target'],
+  };
+}
+
+// The same single `target` argument, plus the caller's own key.
+//
+// `_apiKey` is declared REQUIRED on purpose. The gateway's pre-flight refuses a
+// missing `_`-prefixed required argument with `error: auth_required` and
+// `where_to_get_key` BEFORE the pack is invoked at all, which is the shape
+// edinet ships and the cheapest possible refusal — zero fetches, zero pack
+// execution. The `_` prefix also exempts it from scripts/check-tool-examples.mjs,
+// so the worked examples stay as plain `{ target }` calls.
+//
+// The in-pack gate in callTool() below is kept as well, not as belt-and-braces
+// bookkeeping but because the pack is published standalone to npm and a direct
+// importer never sees the gateway's pre-flight.
+function gatedTargetSchema(description: string) {
+  return {
+    type: 'object' as const,
+    properties: {
+      target: { type: 'string' as const, description },
+      _apiKey: { type: 'string' as const, description: KEY_HINT },
+    },
+    required: ['target', '_apiKey'],
   };
 }
 
@@ -721,7 +778,7 @@ const tools: McpToolExport['tools'] = [
     name: 'mtr',
     description:
       '"Network path to [host]" / "where does traffic to [X] slow down" / "per-hop latency" — mtr report via HackerTarget, combining traceroute and ping into a per-hop table of loss and latency measured FROM HackerTarget\'s probe host, not from you. Use to see which network hop is losing packets. REQUIRES AN API KEY: HackerTarget gates this endpoint, and the keyless tier answers "error valid key required" (verified 2026-09-16).',
-    inputSchema: targetSchema('Hostname or IP to trace to, e.g. "1.1.1.1".'),
+    inputSchema: gatedTargetSchema('Hostname or IP to trace to, e.g. "1.1.1.1".'),
   },
   {
     name: 'nping',
@@ -763,7 +820,7 @@ const tools: McpToolExport['tools'] = [
     name: 'whois',
     description:
       '"Who owns [domain]" / "when does [X] expire" / "whois lookup" / "registrar for [site]" — WHOIS record via HackerTarget for a domain or IP: registrar, creation and expiry dates, nameservers, and whatever contact fields the registry still publishes. REQUIRES AN API KEY: HackerTarget gates this endpoint, and the keyless tier answers "error valid key required" (verified 2026-09-16). For keyless WHOIS use ripe_stat_whois.',
-    inputSchema: targetSchema('Domain name or IP address, e.g. "pipeworx.io".'),
+    inputSchema: gatedTargetSchema('Domain name or IP address, e.g. "pipeworx.io".'),
   },
   {
     name: 'http_headers',
@@ -775,7 +832,7 @@ const tools: McpToolExport['tools'] = [
     name: 'traceroute',
     description:
       '"Traceroute to [host]" / "what route does traffic take to [X]" / "how many hops to [address]" — traceroute via HackerTarget, listing the routers between HackerTarget\'s probe host and the target. The path is measured from their network, not yours. REQUIRES AN API KEY: HackerTarget gates this endpoint, and the keyless tier answers "error valid key required" (verified 2026-09-16).',
-    inputSchema: targetSchema('Hostname or IP to trace to, e.g. "pipeworx.io".'),
+    inputSchema: gatedTargetSchema('Hostname or IP to trace to, e.g. "pipeworx.io".'),
   },
   {
     name: 'subnet_lookup',
@@ -791,17 +848,53 @@ const tools: McpToolExport['tools'] = [
   },
 ];
 
+const KEYLESS_TOOLS = Object.keys(ENDPOINTS).filter((t) => !KEY_GATED.has(t)).join(', ');
+
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
   const path = (ENDPOINTS as Record<string, string>)[name];
   if (!path) throw new Error(`Unknown tool: ${name}`);
   const target = args.target;
   if (typeof target !== 'string' || !target.trim()) throw new Error('Required argument "target" is missing. Pass a string like "example.com".');
-  const res = await pwFetch(`${BASE}/${path}/?q=${encodeURIComponent(target)}`, {
-    headers: { Accept: 'text/plain', 'User-Agent': UA },
-  });
+
+  const rawKey = args._apiKey;
+  const apiKey = typeof rawKey === 'string' && rawKey.trim() ? rawKey.trim() : undefined;
+
+  // The gate, before the fetch. Every one of the eleven other tools reaches the
+  // request below with or without a key — a member key raises their quota, it
+  // does not unlock them.
+  if (KEY_GATED.has(name) && !apiKey) {
+    throw new Error(
+      `auth_required: hackertarget ${name} requires an API key. HackerTarget gates whois, mtr and traceroute behind a paid membership and answers "error valid key required" on the free tier; Pipeworx fronts no key for this pack, so pass your own as _apiKey. Keys come from the HackerTarget member dashboard — sign up at https://hackertarget.com/ip-tools/. The other eleven hackertarget tools (${KEYLESS_TOOLS}) need no key, and ripe_stat_whois answers WHOIS without one.`,
+    );
+  }
+
+  const res = await pwFetch(
+    `${BASE}/${path}/?q=${encodeURIComponent(target)}${apiKey ? `&apikey=${encodeURIComponent(apiKey)}` : ''}`,
+    { headers: { Accept: 'text/plain', 'User-Agent': UA } },
+  );
   if (!res.ok) throw await httpError(res, 'HackerTarget');
   const text = await res.text();
-  if (text.startsWith('error') || text.startsWith('API count exceeded')) throw new Error(`HackerTarget: ${text.split('\n')[0]}`);
+  // Case-INSENSITIVE, and that is not tidiness. HackerTarget answers a missing
+  // key with lowercase "error valid key required" and a REJECTED key with
+  // "Error invalid key" — capital E. The original `startsWith('error')` was
+  // written against the first string and never saw the second, because nothing
+  // ever sent a key. Measured live 2026-09-16: a bad key came back as a clean
+  // 200 with `lines: ["Error invalid key"]`, i.e. the refusal was served to the
+  // caller as data. Exactly the failure class this whole change exists to fix,
+  // one leg over.
+  if (/^(?:error\b|API count exceeded)/i.test(text)) {
+    const first = text.split('\n')[0];
+    // A key WAS supplied and the upstream still refuses: that is a REJECTED
+    // credential, not a missing one. Same auth_required class, deliberately
+    // different words — telling someone who already holds a key that the tool
+    // "requires an API key" sends them to fetch the one they just sent.
+    if (apiKey && /valid key required|invalid (?:api ?)?key|api ?key/i.test(first)) {
+      throw new Error(
+        `auth_required: HackerTarget refused the API key you supplied as _apiKey for ${name} — it answered "${first}". The key was sent and rejected, so check it against the member dashboard at https://hackertarget.com/ip-tools/ and confirm the membership is still active.`,
+      );
+    }
+    throw new Error(`HackerTarget: ${first}`);
+  }
   const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
   return { target, tool: name, lines, raw: text };
 }

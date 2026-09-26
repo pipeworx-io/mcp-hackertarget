@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-hackertarget",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "HackerTarget MCP.",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-b8a62f54c434ef9915af84d460bc4c409c9b3d38b03d75d1e29710bfaba9f57d",
-    "sourceCommit": "76aa8f5d9b5dc2f665563030647c68e661478864"
+    "sourceHash": "v1-15dae183e78696a85a36b8039680e3b82be90be60f698a67cd1c99bf2c3e09bf",
+    "sourceCommit": "1064560fd9dcd0d6fc2606298c2ba244b3a1fbeb"
   }
 }

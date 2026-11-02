@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-hackertarget",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "HackerTarget MCP.",
   "type": "module",
   "main": "lib/index.js",
@@ -27,7 +27,7 @@
     "mode": "gateway",
     "slug": "hackertarget",
     "gatewaySlug": "hackertarget",
-    "sourceHash": "v1-52727a7a453ec59d458193dd58b4976374c0637dd203b5d05e9dfcf7f36622ba",
-    "sourceCommit": "4844029e402d6bd2fe735add8abf6d46735f8ed5"
+    "sourceHash": "v1-c6f303e8cc24dea344b2783901fa232351fb312248f6b582243ea0923ecf0096",
+    "sourceCommit": "0ca9712c0ac03bb0121cc7e81b202d0c45ac02ca"
   }
 }
